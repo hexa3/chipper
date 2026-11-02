@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CHIP-8 Emulator</title>
+<style>
+  :root { --bg:#0e0f12; --panel:#181a1f; --fg:#e8e8e8; --dim:#8a8f98; --accent:#5fd38d; --off:#101010; --on:#e8e8e8; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:820px; margin:0 auto; padding:24px 16px 40px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin:0 0 18px; font-size:14px; }
+  canvas { width:100%; aspect-ratio:2/1; image-rendering:pixelated; background:var(--off); border-radius:8px; display:block; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0; }
+  select, button, input[type=file]::file-selector-button {
+    background:var(--panel); color:var(--fg); border:1px solid #2b2e35; border-radius:6px; padding:7px 12px; font:inherit; cursor:pointer;
+  }
+  button:hover, select:hover { border-color:var(--accent); }
+  input[type=file] { color:var(--dim); font-size:13px; max-width:100%; }
+  label { color:var(--dim); font-size:14px; display:flex; align-items:center; gap:6px; }
+  .pad { display:grid; grid-template-columns:repeat(4, 56px); gap:6px; justify-content:center; margin-top:18px; user-select:none; touch-action:none; }
+  .pad button { height:48px; font-weight:600; font-family:ui-monospace, monospace; }
+  .pad button.down { background:var(--accent); color:#000; }
+  .pad button small { display:block; font-size:10px; color:var(--dim); font-weight:400; }
+  .pad button.down small { color:#000; }
+  footer { color:var(--dim); font-size:13px; margin-top:24px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>CHIP-8 Emulator</h1>
+  <p class="sub">Runs in your browser. Keys <code>1234 QWER ASDF ZXCV</code> map to the hex keypad.</p>
+
+  <canvas id="screen" width="64" height="32"></canvas>
+
+  <div class="bar">
+    <select id="romSelect" aria-label="ROM">
+      <option value="roms/1-chip8-logo.ch8">CHIP-8 logo</option>
+      <option value="roms/2-ibm-logo.ch8" selected>IBM logo</option>
+      <option value="roms/3-corax+.ch8">Corax+ opcode test</option>
+      <option value="roms/4-flags.ch8">Flags test</option>
+    </select>
+    <input type="file" id="romFile" accept=".ch8,.c8,.rom,application/octet-stream" aria-label="Load ROM file">
+    <button id="pauseBtn">Pause</button>
+    <button id="resetBtn">Reset</button>
+    <label>Speed <input type="range" id="speed" min="1" max="50" value="11"> <span id="speedVal">11</span></label>
+    <label><input type="checkbox" id="sound" checked> Sound</label>
+  </div>
+
+  <div class="pad" id="pad"></div>
+
+  <footer>
+    Test ROMs from
+    <a href="https://github.com/Timendus/chip8-test-suite">Timendus/chip8-test-suite</a>.
+    <a href="https://github.com/hexa3/chipper">Source</a>
+  </footer>
+</main>
+<script src="chip8.js"></script>
+<script>
+'use strict';
+const cpu = new Chip8();
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const img = ctx.createImageData(W, H);
+let ipf = 11, paused = false, currentRom = null;
+
+// Keyboard: COSMAC VIP keypad on 1234/QWER/ASDF/ZXCV
+const KEYMAP = { KeyX:0x0, Digit1:0x1, Digit2:0x2, Digit3:0x3, KeyQ:0x4, KeyW:0x5, KeyE:0x6, KeyA:0x7,
+                 KeyS:0x8, KeyD:0x9, KeyZ:0xA, KeyC:0xB, Digit4:0xC, KeyR:0xD, KeyF:0xE, KeyV:0xF };
+const LAYOUT = [[0x1,'1'],[0x2,'2'],[0x3,'3'],[0xC,'4'],[0x4,'Q'],[0x5,'W'],[0x6,'E'],[0xD,'R'],
+                [0x7,'A'],[0x8,'S'],[0x9,'D'],[0xE,'F'],[0xA,'Z'],[0x0,'X'],[0xB,'C'],[0xF,'V']];
+const padBtns = {};
+const pad = document.getElementById('pad');
+for (const [k, label] of LAYOUT) {
+  const b = document.createElement('button');
+  b.innerHTML = k.toString(16).toUpperCase() + '<small>' + label + '</small>';
+  const set = v => e => { e.preventDefault(); setKey(k, v); };
+  b.addEventListener('pointerdown', set(1));
+  b.addEventListener('pointerup', set(0));
+  b.addEventListener('pointerleave', set(0));
+  b.addEventListener('pointercancel', set(0));
+  pad.appendChild(b);
+  padBtns[k] = b;
+}
+function setKey(k, v) { cpu.keys[k] = v; padBtns[k].classList.toggle('down', !!v); }
+addEventListener('keydown', e => { if (e.code in KEYMAP) { setKey(KEYMAP[e.code], 1); e.preventDefault(); } });
+addEventListener('keyup',   e => { if (e.code in KEYMAP) { setKey(KEYMAP[e.code], 0); e.preventDefault(); } });
+addEventListener('blur', () => { for (let k = 0; k < 16; k++) setKey(k, 0); });
+
+// Sound: square-wave beep while sound timer is non-zero
+let audio = null, osc = null, gain = null;
+function ensureAudio() {
+  if (audio) return;
+  try {
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    osc = audio.createOscillator(); gain = audio.createGain();
+    osc.type = 'square'; osc.frequency.value = 440; gain.gain.value = 0;
+    osc.connect(gain).connect(audio.destination); osc.start();
+  } catch (_) { audio = null; }
+}
+addEventListener('pointerdown', ensureAudio, { once: true });
+addEventListener('keydown', ensureAudio, { once: true });
+const soundBox = document.getElementById('sound');
+
+function draw() {
+  const d = img.data;
+  for (let i = 0; i < W * H; i++) {
+    const v = cpu.disp[i] ? 0xE8 : 0x10;
+    d[i*4] = v; d[i*4+1] = v; d[i*4+2] = v; d[i*4+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// Fixed 60 Hz timestep, independent of monitor refresh rate
+let last = performance.now(), acc = 0;
+function loop(now) {
+  acc += Math.min(now - last, 250); last = now;
+  while (acc >= 1000 / 60) {
+    if (!paused && currentRom) cpu.frame(ipf);
+    acc -= 1000 / 60;
+  }
+  if (gain) gain.gain.value = (!paused && cpu.st > 0 && soundBox.checked) ? 0.05 : 0;
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function load(bytes) { currentRom = bytes; cpu.reset(bytes); }
+async function loadUrl(url) {
+  const r = await fetch(url);
+  load(new Uint8Array(await r.arrayBuffer()));
+}
+
+document.getElementById('romSelect').addEventListener('change', e => loadUrl(e.target.value));
+document.getElementById('romFile').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (f) load(new Uint8Array(await f.arrayBuffer()));
+});
+const pauseBtn = document.getElementById('pauseBtn');
+pauseBtn.addEventListener('click', () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; });
+document.getElementById('resetBtn').addEventListener('click', () => currentRom && cpu.reset(currentRom));
+const speed = document.getElementById('speed'), speedVal = document.getElementById('speedVal');
+speed.addEventListener('input', () => { ipf = +speed.value; speedVal.textContent = ipf; });
+
+const q = (new URLSearchParams(location.search).get('rom') || '').replace(/ /g, '+');
+const sel = document.getElementById('romSelect');
+if (q && [...sel.options].some(o => o.value === 'roms/' + q)) sel.value = 'roms/' + q;
+loadUrl(sel.value);
+</script>
+</body>
+</html>
